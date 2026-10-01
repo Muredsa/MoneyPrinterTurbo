@@ -400,7 +400,7 @@ def is_siliconflow_voice(voice_name: str):
 
 
 def is_aitunnel_voice(voice_name: str | None) -> bool:
-    """AITunnel (OpenAI-compatible) TTS, format: aitunnel:model:voice"""
+    """AITunnel (OpenAI-compatible) TTS, format: aitunnel:model[:voice]"""
     return bool(voice_name) and str(voice_name).strip().startswith("aitunnel:")
 
 
@@ -642,9 +642,11 @@ def _single_tts(
             return None
     elif is_aitunnel_voice(voice_name):
         parts = voice_name.strip().split(":")
-        if len(parts) >= 3 and parts[1] and parts[2]:
+        # Voice is optional: models with an empty `voices` catalog (e.g.
+        # seed-audio-1-0) reject any fixed voice, so `aitunnel:<model>` is valid.
+        if len(parts) >= 2 and parts[1]:
             return aitunnel_tts(
-                text, parts[1], parts[2], voice_rate, voice_file
+                text, parts[1], parts[2] if len(parts) > 2 else "", voice_rate, voice_file
             )
         logger.error(f"Invalid aitunnel voice name format: {voice_name}")
         return None
@@ -1542,6 +1544,29 @@ def azure_tts_v1(
     return None
 
 
+def _aitunnel_pcm_only(model: str) -> bool:
+    # Gemini TTS models on AITunnel return raw PCM only (mp3 -> HTTP 400).
+    return "gemini" in model.lower()
+
+
+def _aitunnel_pcm_to_mp3(pcm: bytes, content_type: str, out_path: str) -> bool:
+    """Convert raw s16le PCM (e.g. 'audio/pcm;rate=24000;channels=1') to mp3."""
+    match_rate = re.search(r"rate=(\d+)", content_type)
+    match_channels = re.search(r"channels=(\d+)", content_type)
+    rate = match_rate.group(1) if match_rate else "24000"
+    channels = match_channels.group(1) if match_channels else "1"
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-f", "s16le", "-ar", rate, "-ac", channels, "-i", "pipe:0",
+         "-codec:a", "libmp3lame", "-q:a", "2", out_path],
+        input=pcm,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        logger.error(f"aitunnel pcm to mp3 failed: {result.stderr[-300:]!r}")
+        return False
+    return True
+
+
 def aitunnel_tts(
     text: str,
     model: str,
@@ -1565,10 +1590,11 @@ def aitunnel_tts(
     payload = {
         "model": model,
         "input": text,
-        "voice": voice,
-        "response_format": "mp3",
+        "response_format": "pcm" if _aitunnel_pcm_only(model) else "mp3",
         "speed": max(0.25, min(4.0, voice_rate or 1.0)),
     }
+    if voice:
+        payload["voice"] = voice
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     temporary_audio = None
@@ -1597,7 +1623,15 @@ def aitunnel_tts(
             delete=False,
         ) as f:
             temporary_audio = f.name
-            f.write(response.content)
+            if payload["response_format"] == "pcm":
+                if not _aitunnel_pcm_to_mp3(
+                    response.content,
+                    response.headers.get("content-type", ""),
+                    temporary_audio,
+                ):
+                    return None
+            else:
+                f.write(response.content)
 
         audio_clip = AudioFileClip(temporary_audio)
         try:
