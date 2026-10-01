@@ -34,6 +34,8 @@ from app.utils.subtitle_writer import staged_subtitle_file
 
 _DEFAULT_EDGE_TTS_TIMEOUT_SECONDS = 30.0
 _SILICONFLOW_TTS_TIMEOUT_SECONDS = (10, 300)  # connect, read
+_AITUNNEL_TTS_TIMEOUT_SECONDS = (10, 300)  # connect, read
+_AITUNNEL_TTS_URL = "https://api.aitunnel.ru/v1/audio/speech"
 _MIMO_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 _MIMO_DEFAULT_TTS_MODEL = "mimo-v2.5-tts"
 MINIMAX_TTS_GLOBAL_URL = "https://api.minimax.io/v1/t2a_v2"
@@ -397,6 +399,11 @@ def is_siliconflow_voice(voice_name: str):
     return voice_name.startswith("siliconflow:")
 
 
+def is_aitunnel_voice(voice_name: str | None) -> bool:
+    """AITunnel (OpenAI-compatible) TTS, format: aitunnel:model:voice"""
+    return bool(voice_name) and str(voice_name).strip().startswith("aitunnel:")
+
+
 def is_gemini_voice(voice_name: str):
     """检查是否是Gemini TTS的声音"""
     return voice_name.startswith("gemini:")
@@ -481,6 +488,8 @@ def is_azure_v1_voice(voice_name: str | None) -> bool:
     if is_azure_v2_voice(name):
         return False
     if is_siliconflow_voice(name):
+        return False
+    if is_aitunnel_voice(name):
         return False
     if is_gemini_voice(name):
         return False
@@ -631,6 +640,14 @@ def _single_tts(
         else:
             logger.error(f"Invalid siliconflow voice name format: {voice_name}")
             return None
+    elif is_aitunnel_voice(voice_name):
+        parts = voice_name.strip().split(":")
+        if len(parts) >= 3 and parts[1] and parts[2]:
+            return aitunnel_tts(
+                text, parts[1], parts[2], voice_rate, voice_file
+            )
+        logger.error(f"Invalid aitunnel voice name format: {voice_name}")
+        return None
     elif is_gemini_voice(voice_name):
         # 从voice_name中提取声音名称
         # 格式: gemini:voice-Style；也继续兼容旧的 gemini:voice-Gender。
@@ -1523,6 +1540,95 @@ def azure_tts_v1(
                         f"{temp_path}, error: {remove_error}"
                     )
     return None
+
+
+def aitunnel_tts(
+    text: str,
+    model: str,
+    voice: str,
+    voice_rate: float,
+    voice_file: str,
+) -> Union[SubMaker, None]:
+    """
+    AITunnel 的 OpenAI 兼容 TTS：POST https://api.aitunnel.ru/v1/audio/speech
+    （例如 model=seed-audio-1-0）。返回的音频整段合成，没有逐词时间戳，
+    字幕沿用整段文本的时间轴（与 SiliconFlow 相同）。
+    """
+    text = text.strip()
+    api_key = (
+        config.aitunnel.get("api_key", "") or os.environ.get("AITUNNEL_API_KEY", "")
+    ).strip()
+    if not api_key:
+        logger.error("AITunnel API key is not set")
+        return None
+
+    payload = {
+        "model": model,
+        "input": text,
+        "voice": voice,
+        "response_format": "mp3",
+        "speed": max(0.25, min(4.0, voice_rate or 1.0)),
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    temporary_audio = None
+    try:
+        logger.info(f"start aitunnel tts, model: {model}, voice: {voice}")
+        # Paid request: no retry once the request may have been accepted.
+        response = requests.post(
+            _AITUNNEL_TTS_URL,
+            json=payload,
+            headers=headers,
+            timeout=_AITUNNEL_TTS_TIMEOUT_SECONDS,
+        )
+        if response.status_code != 200:
+            logger.error(
+                f"aitunnel tts failed with status code {response.status_code}: {response.text[:500]}"
+            )
+            return None
+        if not response.content:
+            logger.error("aitunnel tts returned empty audio")
+            return None
+
+        ensure_file_path_exists(voice_file)
+        with tempfile.NamedTemporaryFile(
+            dir=os.path.dirname(os.path.abspath(voice_file)),
+            suffix=".mp3",
+            delete=False,
+        ) as f:
+            temporary_audio = f.name
+            f.write(response.content)
+
+        audio_clip = AudioFileClip(temporary_audio)
+        try:
+            audio_duration = audio_clip.duration
+        finally:
+            audio_clip.close()
+        if (
+            not isinstance(audio_duration, (int, float))
+            or not math.isfinite(audio_duration)
+            or audio_duration <= 0
+        ):
+            logger.error("aitunnel tts returned invalid audio")
+            return None
+
+        os.replace(temporary_audio, voice_file)
+        temporary_audio = None
+        logger.success(f"aitunnel tts succeeded: {voice_file}")
+        return populate_legacy_submaker_with_full_text(
+            sub_maker=ensure_legacy_submaker_fields(SubMaker()),
+            text=text,
+            audio_duration_seconds=audio_duration,
+        )
+    except Exception as e:
+        logger.error(f"aitunnel tts failed: {type(e).__name__}: {e}")
+        return None
+    finally:
+        if temporary_audio and os.path.exists(temporary_audio):
+            try:
+                os.unlink(temporary_audio)
+            except OSError:
+                pass
 
 
 def siliconflow_tts(
