@@ -1268,6 +1268,11 @@ OPENAI_IMAGE_KEY_ERROR_STATUS_CODES = frozenset({401, 403})
 OPENAI_IMAGE_MAX_ATTEMPTS = 3
 OPENAI_IMAGE_MAX_BYTES = 25 * 1024 * 1024
 OPENAI_IMAGE_MAX_PIXELS = 50_000_000
+OPENAI_IMAGE_ASPECT_RATIOS = {
+    VideoAspect.portrait: "9:16",
+    VideoAspect.landscape: "16:9",
+    VideoAspect.square: "1:1",
+}
 # 串行出图 + 线性退避，兼容中转服务普遍的限流恢复窗口。
 OPENAI_IMAGE_RETRY_BACKOFF_SECONDS = (5, 15, 30)
 # 同步生成接口可能需要数十秒才返回图片，读超时给足余量。
@@ -1657,13 +1662,20 @@ def generate_images_openai(
     aspect = VideoAspect(video_aspect)
     clip_duration = max(int(minimum_duration), 1)
     endpoint, model = _openai_image_endpoint()
-    image_size = _openai_image_size(aspect)
     payload = {
         "model": model,
         "prompt": _openai_image_prompt(search_term),
         "n": 1,
-        "size": image_size,
     }
+    # Some gateways (e.g. AITunnel Gemini/Seedream models) reject pixel sizes
+    # and expect aspect_ratio ("9:16") instead; opt in with
+    # openai_image_use_aspect_ratio = true.
+    if config.app.get("openai_image_use_aspect_ratio", False):
+        image_size = OPENAI_IMAGE_ASPECT_RATIOS.get(aspect, "1:1")
+        payload["aspect_ratio"] = image_size
+    else:
+        image_size = _openai_image_size(aspect)
+        payload["size"] = image_size
     logger.info(
         f"generating image via openai-compatible endpoint: model={model}, "
         f"term={search_term!r}, size={image_size}"

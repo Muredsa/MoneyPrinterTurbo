@@ -202,6 +202,9 @@ openai_image_model = ""
 # landscape 1536x1024, square 1024x1024). Set a custom value (e.g. "1080x1920")
 # for local gateways that accept arbitrary resolutions.
 openai_image_size = ""
+# Send aspect_ratio ("9:16" / "16:9" / "1:1") instead of size. Needed by gateways
+# such as AITunnel whose Gemini/Seedream models reject pixel sizes.
+openai_image_use_aspect_ratio = false
 # Optional prompt template applied to every search term. Use the "{term}"
 # placeholder to inject the keyword; leave empty to send terms as-is.
 # Example: "cinematic photo of {term}, photorealistic, high detail"
